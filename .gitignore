@@ -1,0 +1,9 @@
+*.pdf
+*.csv
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
