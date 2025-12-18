@@ -5,123 +5,187 @@ VERSION:        v1.0
 PURPOSE:        Generate multi-page PDF reports with charts organized by series, plots, pages, and files
 """
 
-from __future__ import annotations
+# Import dependencies
+from __future__ import annotations # Lets type hints refer to classes defined later.
 
-import logging
-import warnings
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable, Literal
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from enum import Enum
-import re
-import sys
-import time
+import logging # Used for structured logging (to understand errors incase they occur instead of prints): logger.info(), logger.error().
+import warnings # Used to manage warnings (e.g., suppressing matplotlib warnings)
+from dataclasses import dataclass, field # used for defining simple data container classes
+from pathlib import Path # used for filesystem path manipulations
+from typing import Any, Callable, Literal  # Type hints to document expected types.
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor # for parallel processing
+from enum import Enum ## For defining small sets of constant choices.
+import re # for regular expressions (e.g., sanitizing filenames)
+import sys # for system-level operations (e.g., flushing stdout)
+import time # Used for timing and ETA calculations.
 
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.figure import Figure
-from matplotlib.axes import Axes
-import numpy as np
-import pandas as pd
+# ============================================================================================
+# PLOTTING LIBRARIES
+# ============================================================================================
+import matplotlib.pyplot as plt # Main plotting library
+import matplotlib.gridspec as gridspec  # Main plotting API (figures, axes, plot calls).
+from matplotlib.backends.backend_pdf import PdfPages # For multi-page PDF output
+from matplotlib.figure import Figure # For figure objects
+from matplotlib.axes import Axes # For axes objects
+import numpy as np # For numerical operations
+import pandas as pd # For data manipulation
 
-# Optional imports with fallbacks
+# Optional progress bar library
+# If available, tqdm gives nicer progress bars; code handles it being absent.
 try:
     from tqdm import tqdm
     TQDM_AVAILABLE = True
 except ImportError:
     TQDM_AVAILABLE = False
 
-# Define class for chart types with enum types
+# Define class for chart types with enum (constant) types
 class ChartType(Enum):
-    """Supported chart types."""
-    LINE = "line"
-    BAR = "bar"
-    STACKED_BAR = "stacked_bar"
-    GROUPED_BAR = "grouped_bar"
-    AREA = "area"
-    STACKED_AREA = "stacked_area"
-    SCATTER = "scatter"
-    STEP = "step"
+    """
+     An Enum defines a set of allowed constant values.
+    
+    This enum specifies all the supported chart types.
+    Using an Enum prevents typos (you can't use "lin" instead of "line").
+    
+    Each line defines a chart type:
+    - Name on left (e.g., LINE) is what you use in code
+    - String on right (e.g., "line") is a human-readable identifier
+    """
+    LINE = "line" # Simple line chart
+    BAR = "bar" # Simple bar chart
+    STACKED_BAR = "stacked_bar" # Stacked bar chart
+    GROUPED_BAR = "grouped_bar" # Grouped bar chart
+    AREA = "area" # Simple area chart
+    STACKED_AREA = "stacked_area" # Stacked area chart
+    SCATTER = "scatter" # Scatter plot
+    STEP = "step" # Step funtion - vertical then horizontal lines
     LINE_SCATTER = "line_scatter"  # Line with markers (default behavior)
 
 # Progress tracking utility class
 class ProgressTracker:
     """
-    Progress tracking utility that works with or without tqdm.
-    Provides consistent progress feedback regardless of environment.
+    Tracks progress during long-running operations.
+    
+    Works with or without tqdm library. If tqdm is available, shows a nice
+    progress bar. Otherwise, prints basic progress messages.
+    
+    This class handles both the progress bar display and calling a callback function when progress updates occur.
     """
     
     def __init__(
-        self, 
-        total: int, 
-        description: str = "Processing",
-        show_progress: bool = True,
-        use_tqdm: bool = True,
-        callback: Callable[[int, int, str], None] | None = None
+        self,  # Self reference
+        total: int,  # Total number of items to process
+        description: str = "Processing", # Description for progress
+        show_progress: bool = True, # Whether to show progress
+        use_tqdm: bool = True, # Whether to use tqdm if available
+        callback: Callable[[int, int, str], None] | None = None # Optional callback on update
     ):
-        self.total = total
-        self.current = 0
-        self.description = description
-        self.show_progress = show_progress
-        self.callback = callback
-        self.start_time = time.time()
-        self.use_tqdm = use_tqdm and TQDM_AVAILABLE
-        self._pbar = None
+        """
+        Initialize the progress tracker.
+        
+        Parameters
+        ----------
+        total : int
+            The total number of items to process (for calculating percentage)
+        description : str, optional
+            Text to show before the progress bar
+        show_progress : bool, optional
+            If False, no progress is shown at all
+        use_tqdm : bool, optional
+            If True and tqdm is available, use the fancy progress bar
+        callback : Callable, optional
+            Function to call on each update: callback(current, total, message)
+        """
+        self.total = total # Total items to process
+        self.current = 0 # Current progress count
+        self.description = description # Description text
+        self.show_progress = show_progress # Whether to show progress
+        self.callback = callback # Callback function
+        self.start_time = time.time() # Start time for ETA calculations
+        self.use_tqdm = use_tqdm and TQDM_AVAILABLE # Use tqdm if available
+        self._pbar = None # tqdm progress bar object
         
         if self.show_progress and self.use_tqdm:
             self._pbar = tqdm(
                 total=total, 
                 desc=description,
-                unit="item",
-                ncols=80,
-                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+                unit="item", # Unit label (e.g., "i20 tems")
+                ncols=80, # Width of the progress bar
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]' # bar format
             )
         elif self.show_progress:
-            self._print_progress()
+            self._print_progress() # Initial print without tqdm
     
     def update(self, n: int = 1, message: str = "") -> None:
-        """Update progress by n steps."""
-        self.current += n
+        """
+        Update progress by n items.
         
+        Parameters
+        ----------
+        n : int, optional
+            How many items to advance progress by (default 1)
+        message : str, optional
+            Status message to display alongside progress
+        """
+        self.current += n # Increment current count
+        
+        # Call the callback function if provided
+        # This allows external code to track progress (e.g., update a UI)
         if self.callback:
             self.callback(self.current, self.total, message)
         
+        # Update the progress display
         if self.show_progress:
             if self.use_tqdm and self._pbar:
                 self._pbar.update(n)
                 if message:
                     self._pbar.set_postfix_str(message[:30])
             else:
-                self._print_progress(message)
+                self._print_progress(message) # Print progress without tqdm
     
     def _print_progress(self, message: str = "") -> None:
-        """Print progress without tqdm."""
-        if self.total == 0:
-            pct = 100
-        else:
-            pct = (self.current / self.total) * 100
+        """
+        Print manual progress bar (used when tqdm is not available).
         
+        Creates output like: "Processing: |████░░░░| 5/10 (50.0%) ETA: 2.5s"
+        
+        Parameters
+        ----------
+        message : str, optional
+            Optional status message to append
+        """
+        # Calculate percentage complete
+        if self.total == 0:
+            pct = 100 # Avoid division by zero
+        else:
+            pct = (self.current / self.total) * 100 
+        
+        # Calculate elapsed time and ETA
         elapsed = time.time() - self.start_time
         
+         # Calculate ETA (estimated time to completion)
         if self.current > 0 and self.current < self.total:
+             # Time per item * remaining items = time to finish
             eta = (elapsed / self.current) * (self.total - self.current)
             eta_str = f"ETA: {eta:.1f}s"
         else:
             eta_str = ""
         
+         # Create the progress bar string
         bar_width = 30
         filled = int(bar_width * self.current / max(self.total, 1))
         bar = "█" * filled + "░" * (bar_width - filled)
         
+        # Build the full status string
         status = f"\r{self.description}: |{bar}| {self.current}/{self.total} ({pct:.1f}%) {eta_str}"
         if message:
+            # Append message (first 20 chars) if provided
             status += f" - {message[:20]}"
         
+         # Write to console without newline (\r goes back to start of line)
         sys.stdout.write(status + " " * 10)
         sys.stdout.flush()
         
+        # When complete, print newline to finish the progress bar
         if self.current >= self.total:
             sys.stdout.write("\n")
             sys.stdout.flush()
@@ -141,18 +205,29 @@ class ProgressTracker:
         self.close()
 
 # Configure logging
+# This helps track what the program is doing and catch errors
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
+# DATACLASS: ChartStyle
+
 @dataclass
 class ChartStyle:
-    """Configuration for chart styling."""
-    color_assignment: dict[str, str] = field(default_factory=dict)
-    line_assignment: dict[str, str] = field(default_factory=dict)
-    symbol_assignment: dict[str, str] = field(default_factory=dict)
+    """
+    Configuration for styling charts (colors, line styles, symbols/markers).
     
-    # Default matplotlib markers mapped from R's pch values
+    A dataclass is like a simple data container class. The @dataclass decorator
+    automatically creates the __init__ method and other useful methods.
+    
+    This class holds the mappings between data values and their visual styles.
+    For example: map "Nitrogen" to color "#FF0000" (red), i generate colors from https://coolors.co/
+    """
+    color_assignment: dict[str, str] = field(default_factory=dict) # Dictionary mapping series names to colors (hex or named colors)
+    line_assignment: dict[str, str] = field(default_factory=dict) # Dictionary mapping series names to line styles
+    symbol_assignment: dict[str, str] = field(default_factory=dict) # Dictionary mapping flag values to matplotlib markers
+    
+    # Default matplotlib markers mapped from values
     DEFAULT_MARKERS: dict[int, str] = field(default_factory=lambda: {
         0: 's', 1: 'o', 2: '^', 3: '+', 4: 'x', 5: 'D',
         6: 'v', 7: 's', 8: '*', 15: 's', 16: 'o', 17: '^',
@@ -167,7 +242,7 @@ class ChartStyle:
         '1': '-', '2': '--', '3': ':', '4': '-.',
     })
     
-    @classmethod
+    @classmethod # classmethod means this function is called on the class, not instances of the class
     def from_data(
         cls,
         data: pd.DataFrame,
@@ -195,7 +270,7 @@ class ChartStyle:
             List of line types. If None, uses ['solid', 'dashed', 'dotted', 'dashdot'].
             Only as many as unique series values will be used.
         symbols : list[str | int], optional
-            List of markers (matplotlib) or R pch values (integers 0-25).
+            List of markers (matplotlib) or values (integers 0-25).
             If None, auto-assigns appropriate markers.
             Only as many as unique flag values will be used.
         
@@ -205,6 +280,8 @@ class ChartStyle:
             A ChartStyle instance with assignments based on data
         
         """
+        
+        # Initialize empty assignment dictionaries
         color_assignment = {}
         line_assignment = {}
         symbol_assignment = {}
@@ -218,30 +295,30 @@ class ChartStyle:
             24: '^', 25: 'v'
         }
         
-        # Default palettes
+        # Default color palettes
         default_colors = [
             '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
             '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
             '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5'
         ]
-        default_linetypes = ['-', '--', ':', '-.', (0, (5, 5)), (0, (3, 1, 1, 1))]
-        default_symbols = ['o', 's', '^', 'D', 'v', 'x', '+', '*', 'p', 'h']
+        default_linetypes = ['-', '--', ':', '-.', (0, (5, 5)), (0, (3, 1, 1, 1))] # default line styles
+        default_symbols = ['o', 's', '^', 'D', 'v', 'x', '+', '*', 'p', 'h'] # default markers
         
-        colors = colors or default_colors
-        linetypes = linetypes or default_linetypes
-        symbols = symbols or default_symbols
+        colors = colors or default_colors # Use custom colors if provided, else defaults
+        linetypes = linetypes or default_linetypes # use custom linetypes if provided, else defaults
+        symbols = symbols or default_symbols # use custom symbols if provided, else defaults
         
         # Assign colors and linetypes to series
         if series_by and series_by in data.columns:
             unique_series = data[series_by].dropna().unique()
-            for i, val in enumerate(unique_series):
+            for i, val in enumerate(unique_series): # Assign colors and linetypes in round-robin fashion. Round-robin means if there are more unique values than colors/linetypes, it starts over from the beginning of the list.
                 color_assignment[val] = colors[i % len(colors)]
                 line_assignment[val] = linetypes[i % len(linetypes)]
         
         # Assign symbols to flags if symbol_by is provided
         if symbol_by and symbol_by in data.columns:
             unique_symbols = data[symbol_by].dropna().unique()
-            for i, val in enumerate(unique_symbols):
+            for i, val in enumerate(unique_symbols): # Assign symbols in round-robin fashion
                 sym = symbols[i % len(symbols)]
                 # Convert to matplotlib if it's an integer
                 if isinstance(sym, int):
@@ -249,6 +326,7 @@ class ChartStyle:
                 symbol_assignment[str(val)] = sym
         
         return cls(
+            # Return a new ChartStyle instance with the generated assignments
             color_assignment=color_assignment,
             line_assignment=line_assignment,
             symbol_assignment=symbol_assignment
@@ -262,9 +340,6 @@ def create_color_assignment(
 ) -> dict[str, str]:
     """
     Create color assignment dictionary from data column.
-    
-    Equivalent to R:
-        colour_assignment <- setNames(colours, unique(data[[column]]))
     
     Parameters
     ----------
@@ -310,7 +385,7 @@ def create_line_assignment(
     
     --------
     """
-    # Map R-style names to matplotlib
+    # Map linestyle names to matplotlib styles
     linetype_map = {
         'solid': '-', 'dashed': '--', 'dotted': ':', 'dashdot': '-.',
         'longdash': (0, (5, 5)), 'twodash': (0, (3, 1, 1, 1)),
@@ -343,14 +418,14 @@ def create_symbol_assignment(
     column : str
         Column name to get unique values from (e.g., "Flag")
     symbols : list[str | int], optional
-        List of matplotlib markers or R pch values (0-25).
+        List of matplotlib markers or values (0-25).
         If None, automatically assigns appropriate symbols based on data.
         You can also pass fewer symbols than unique values - they will cycle.
     
     Returns
     -------
     """
-    # Map R pch values to matplotlib markers
+    # Map symbol values to matplotlib markers
     pch_to_marker = {
         0: 's', 1: 'o', 2: '^', 3: '+', 4: 'x', 5: 'D',
         6: 'v', 7: 's', 8: '*', 9: 'd', 10: 'o', 11: '*',
@@ -408,7 +483,7 @@ def auto_symbols(data: pd.DataFrame, column: str, use_pch: bool = False) -> list
     column : str
         Column name (e.g., "Flag")
     use_pch : bool, optional
-        If True, return R pch values (1, 2, 3, ...).
+        If True, return  values (1, 2, 3, ...).
         If False, return matplotlib marker strings ('o', 's', '^', ...).
     
     Returns
@@ -430,63 +505,69 @@ def auto_symbols(data: pd.DataFrame, column: str, use_pch: bool = False) -> list
 
 @dataclass
 class ChartConfig:
-    """Configuration for chart generation."""
-    output_folder: str | Path = "output/"
-    series_by: str = "ItemName"
-    x_variable: str = "Year"
-    y_variable: str = "Value"
-    plots_by: str = "ElementName"
-    pages_by: str = "AreaName"
-    files_by: str | None = None
-    symbol_by: str | None = "Flag"
-    units: str | None = "Unit"
-    plots_per_row: int = 3
-    plots_per_column: int = 2
-    file_name: str = "chart"
+    """Configuration for chart generation. Holds all user-settable options for plotting."""
+    output_folder: str | Path = "output/" # Folder to save output files with default output path
+    series_by: str = "ItemName" # Column name for series (different lines/bars in a plot) with default value
+    x_variable: str = "Year" # Column name for x-axis variable with default value
+    y_variable: str = "Value" # Column name for y-axis variable with default value
+    plots_by: str = "ElementName" # Column name for different plots on a page with default value
+    pages_by: str = "AreaName" # Column name for different pages in a file with default value
+    files_by: str | None = None # Column name for different files (None = single file) with default value
+    symbol_by: str | None = "Flag" # Column name for symbols/markers (None = no symbols) with default value
+    units: str | None = "Unit" # Column name for units (None = no units) with default value
+    plots_per_row: int = 3 # Number of plots per row on a page with default value
+    plots_per_column: int = 2 # Number of plots per column on a page with default value
+    file_name: str = "chart" # Base name for output files with default value
     
     # Style configuration
-    style: ChartStyle = field(default_factory=ChartStyle)
+    style: ChartStyle = field(default_factory=ChartStyle) # ChartStyle instance with default style
     
-    chart_type: ChartType | str = ChartType.LINE_SCATTER
-    
-    output_format: Literal['pdf', 'png', 'svg', 'all'] = 'pdf'
-    dpi: int = 150
+    chart_type: ChartType | str = ChartType.LINE_SCATTER # Type of chart to create with default value
+     
+    output_format: Literal['pdf', 'png', 'svg', 'all'] = 'pdf' # Output file format with default value
+    dpi: int = 150 # Resolution for raster formats (png) with default value
     figure_width: float = 29.7 / 1.8  # inches (A4 landscape)
-    figure_height: float = 21 / 1.8
-    theme: Literal['minimal', 'dark', 'default'] = 'minimal'
-    truncate_labels: int = 12
-    show_progress: bool = True
-    parallel: bool = False
-    n_workers: int = 4
-    date_format: str | None = None  # For datetime x-axis
-    title_fontsize: int = 10
-    label_fontsize: int = 9
-    legend_fontsize: int = 8
-    grid_alpha: float = 0.3
-    line_width: float = 1.5
-    marker_size: float = 7  # Increased from 4 for better visibility (like R)
+    figure_height: float = 21 / 1.8 # inches (A4 landscape)
+    theme: Literal['minimal', 'dark', 'default'] = 'minimal' # Visual theme with default value
+    truncate_labels: int = 12 # Max length for series/page/plot labels with default value
+    show_progress: bool = True # Whether to show progress bar with default value
+    parallel: bool = False # Whether to use parallel processing with default value
+    n_workers: int = 4 # Number of parallel workers (if parallel=True) with default value
+    date_format: str | None = None  # For datetime x-axis 
+    title_fontsize: int = 10 # Font size for titles with default value
+    label_fontsize: int = 9 # Font size for axis labels with default value
+    legend_fontsize: int = 8 # Font size for legend text with default value
+    grid_alpha: float = 0.3 # Alpha transparency for grid lines with default value
+    line_width: float = 1.5 # Line width for line charts with default value
+    marker_size: float = 7  # Increased from 4 for better visibility
     marker_edge_width: float = 1.0  # Edge/border width for markers
     marker_edge_color: str | None = None  # Edge color (None = same as fill)
     bar_width: float = 0.8  # For bar charts
     alpha: float = 0.7  # Transparency for area/bar charts
     
     # Legend configuration
-    legend_position: Literal['inside', 'outside', 'bottom', 'right', 'none'] = 'outside'
-    show_series_legend: bool = True
-    show_symbol_legend: bool = True
+    legend_position: Literal['inside', 'outside', 'bottom', 'right', 'none'] = 'outside' # Legend position with default value
+    show_series_legend: bool = True # Whether to show legend for series with default value
+    show_symbol_legend: bool = True # Whether to show legend for symbols with default value
     
     # Grid and axis configuration
-    show_all_years: bool = True  # Use smart year intervals on x-axis
+    show_all_years: bool = True  # Use year intervals on x-axis
     show_every_year: bool = False  # Force showing EVERY year label (may overlap for large ranges)
-    show_minor_grid: bool = True  # Show minor gridlines (like R)
+    show_minor_grid: bool = True  # Show minor gridlines in charts
     show_minor_ticks: bool = False  # Show minor tick marks (usually False for cleaner look)
     minor_grid_alpha: float = 0.15  # Alpha for minor gridlines
     x_axis_interval: int | None = None  # Custom interval for x-axis (None = auto)
     
     # Progress callback
-    progress_callback: Callable[[int, int, str], None] | None = None
+    progress_callback: Callable[[int, int, str], None] | None = None # Optional callback for progress updates
     
     def __post_init__(self):
+        """
+        Docstring for __post_init__
+        
+        :param self: Description
+        Post-initialization to convert output_folder to Path object and chart_type to ChartType enum.
+        """
         self.output_folder = Path(self.output_folder)
         # Convert string to ChartType if needed
         if isinstance(self.chart_type, str):
@@ -496,13 +577,14 @@ class ChartConfig:
 @dataclass
 class ChartResult:
     """Result object returned after chart generation."""
-    files_created: list[Path] = field(default_factory=list)
-    pages_generated: int = 0
-    plots_generated: int = 0
-    warnings: list[str] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
+    files_created: list[Path] = field(default_factory=list) #  output files created
+    pages_generated: int = 0 # total pages generated
+    plots_generated: int = 0 # total plots generated
+    warnings: list[str] = field(default_factory=list) # list of warnings encountered
+    errors: list[str] = field(default_factory=list) # list of errors encountered
     
     def summary(self) -> str:
+        """Generate a summary of the chart generation results."""
         return (
             f"Charts generated successfully:\n"
             f"  Files created: {len(self.files_created)}\n"
@@ -538,7 +620,7 @@ def _apply_theme(ax: Axes, config: ChartConfig) -> None:
             ax.grid(True, which='minor', alpha=config.minor_grid_alpha, linestyle='-', linewidth=0.3)
             # Only show minor grid on x-axis (vertical lines for years)
             ax.tick_params(axis='y', which='minor', left=False)
-    elif theme == 'dark':
+    elif theme == 'dark': # Dark theme
         ax.set_facecolor('#2E2E2E')
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
@@ -624,21 +706,21 @@ def _create_single_plot(
                       ChartType.STACKED_AREA):
         # Pivot data for stacked/grouped visualization
         pivot_data = data.pivot_table(
-            index=config.x_variable,
+            index=config.x_variable, 
             columns=config.series_by,
             values=config.y_variable,
-            aggfunc='sum'
+            aggfunc='sum' # sum values for stacking/grouping
         ).fillna(0)
         
         x_vals = pivot_data.index.values
         
         if chart_type == ChartType.STACKED_BAR:
-            bottom = np.zeros(len(x_vals))
-            bar_width = config.bar_width * 0.8
+            bottom = np.zeros(len(x_vals)) # Initialize bottom for stacking
+            bar_width = config.bar_width * 0.8 # Total bar width
             
-            for series_name in pivot_data.columns:
-                y_vals = pivot_data[series_name].values
-                color = series_colors.get(series_name, '#1f77b4')
+            for series_name in pivot_data.columns: 
+                y_vals = pivot_data[series_name].values # Get y values for this series
+                color = series_colors.get(series_name, '#1f77b4') # Default color if not assigned
                 ax.bar(
                     x_vals, y_vals, bottom=bottom,
                     width=bar_width, label=str(series_name)[:config.truncate_labels],
@@ -941,7 +1023,7 @@ def _create_single_plot(
                     series_labels.append(l)
                     seen.add(l)
         
-        # Create symbol legend handles - show ALL flags present in THIS plot
+        # Create symbol legend handles - show ALL flags present
         if config.show_symbol_legend and config.symbol_by and config.symbol_by in data.columns:
             # Get all unique flag values from this plot's data
             symbol_vals = data[config.symbol_by].dropna().unique()
@@ -1137,7 +1219,8 @@ def multiple_line_charts(
     """
     Generate multi-page PDF charts from time series data.
     
-    This function creates publication-ready charts organized hierarchically:
+    This function creates pdf charts with multiple pages and plots based on the provided data
+    and configuration. It supports splitting the charts by:
     - Multiple files (optional, split by `files_by`)
     - Multiple pages per file (split by `pages_by`)
     - Multiple plots per page (split by `plots_by`)
@@ -1166,7 +1249,7 @@ def multiple_line_charts(
     result = ChartResult()
     
     # Validate output folder
-    if not config.output_folder.exists(): #type: ignore
+    if not config.output_folder.exists(): # Create directory if it doesn't exist
         try:
             config.output_folder.mkdir(parents=True, exist_ok=True)
             logger.info(f"Created output folder: {config.output_folder}")
@@ -1212,6 +1295,7 @@ def multiple_line_charts(
     # Initialize main progress tracker
     logger.info(f"Starting chart generation: {len(file_groups)} file(s), ~{total_pages} page(s)")
     
+    # File progress tracker
     file_progress = ProgressTracker(
         total=len(file_groups),
         description="Files",
